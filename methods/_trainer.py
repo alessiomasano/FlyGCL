@@ -19,7 +19,7 @@ from torchvision import transforms
 from datasets import *
 from utils.augment import Cutout
 from utils.data_loader import get_statistics
-from utils.onlinesampler import OnlineSampler, OnlineTestSampler
+from utils.onlinesampler import OnlineSampler, OnlineTestSampler, CIRSampler, RenditionSampler, FewShotSampler
 from utils.train_utils import select_model, select_optimizer, select_scheduler
 
 logger = logging.getLogger()
@@ -94,7 +94,7 @@ class _Trainer():
         if "autoaug" in self.transforms:
             if 'cifar' in self.dataset:
                 train_transform.append(transforms.AutoAugment(transforms.AutoAugmentPolicy('cifar10')))
-            elif 'imagenet' in self.dataset:
+            elif 'imagenet' in self.dataset or 'domainnet' in self.dataset:
                 train_transform.append(transforms.AutoAugment(transforms.AutoAugmentPolicy('imagenet')))
             elif 'wikiart' in self.dataset:
                 train_transform.append(transforms.AutoAugment(transforms.AutoAugmentPolicy('imagenet')))
@@ -122,7 +122,7 @@ class _Trainer():
                 # No ToTensor() since input is already a tensor
                 transforms.Normalize(mean, std),])
 
-        if 'imagenet' in self.dataset or 'cub' in self.dataset or 'car' in self.dataset:
+        if 'imagenet' in self.dataset or 'cub' in self.dataset or 'car' in self.dataset or 'domainnet' in self.dataset:
             self.load_transform = transforms.Compose([
                 transforms.Resize((inp_size, inp_size)),
                 transforms.ToTensor()])
@@ -135,7 +135,14 @@ class _Trainer():
 
         _r = dist.get_rank() if self.distributed else None       # means that it is not distributed
         _w = dist.get_world_size() if self.distributed else None # means that it is not distributed
-        self.train_sampler = OnlineSampler(self.online_iter_dataset, self.n_tasks, self.m, self.n, self.rnd_seed, 0, self.rnd_NM, _w, _r)
+        if getattr(self, "stream", "siblurry") == "cir":
+            self.train_sampler = CIRSampler(self.online_iter_dataset, self.n_tasks, self.cir_p_rep, self.rnd_seed, self.cir_first)
+        elif getattr(self, "stream", "siblurry") == "fewshot":
+            self.train_sampler = FewShotSampler(self.online_iter_dataset, self.n_tasks, self.fs_shots, self.rnd_seed, self.fs_base_frac, self.fs_trickle)
+        elif getattr(self, "stream", "siblurry") == "rendition":
+            self.train_sampler = RenditionSampler(self.online_iter_dataset, self.rend_seq, self.rnd_seed, self.rend_len, self.rend_p_return); self.n_tasks = self.train_sampler.E
+        else:
+            self.train_sampler = OnlineSampler(self.online_iter_dataset, self.n_tasks, self.m, self.n, self.rnd_seed, 0, self.rnd_NM, _w, _r)
         self.train_dataloader = DataLoader(self.online_iter_dataset, batch_size=self.batchsize, sampler=self.train_sampler, pin_memory=False, num_workers=0)
         self.test_sampler = OnlineTestSampler(self.test_dataset, [], _w, _r)
 
@@ -301,7 +308,11 @@ class _Trainer():
                 for i, (images, labels, idx) in enumerate(self.train_dataloader):
                     samples_cnt += images.size(0) * self.world_size
 
-                    loss, acc = self.online_step(images, labels, idx)
+                    stride = int(getattr(self, "stream_stride", 1) or 1)
+                    if stride > 1 and (i % stride) != 0:          # compute-matched stream: this batch passes by unlearned
+                        self.add_new_class(labels); loss, acc = 0.0, 0.0
+                    else:
+                        loss, acc = self.online_step(images, labels, idx)
 
                     if samples_cnt + images.size(0) * self.world_size > num_report:
                         self.report_training(samples_cnt, loss, acc)
@@ -321,6 +332,7 @@ class _Trainer():
                                 eval_results["test_acc"].append(eval_dict['avg_acc'])
                                 eval_results["avg_acc"].append(eval_dict['cls_acc'])
                                 eval_results["data_cnt"].append(num_eval)
+                                eval_results["wall"].append(time.time() - self.start_time)
                                 self.report_test(num_eval, eval_dict["avg_loss"], eval_dict['avg_acc'])
                             num_eval += self.eval_period
 
@@ -396,6 +408,8 @@ class _Trainer():
             if self.eval_period != np.inf:
                 np.save(f'{self.log_dir}/seed_{self.rnd_seed}_eval.npy', eval_results['test_acc'])
                 np.save(f'{self.log_dir}/seed_{self.rnd_seed}_eval_time.npy', eval_results['data_cnt'])
+                np.save(f'{self.log_dir}/seed_{self.rnd_seed}_eval_wall.npy', eval_results['wall'])
+                np.save(f'{self.log_dir}/seed_{self.rnd_seed}_cls_acc.npy', np.array(task_records["cls_acc"]))
 
             # Optional post-hoc expert representation analysis (e.g., FlyPrompt/DualPrompt/MVP).
             if getattr(self, "analysis_expert_similarity", False):
@@ -545,7 +559,7 @@ class _Trainer():
     def report_training(self, sample_num, train_loss, train_acc):
         logger.info(
             f"Train | Sample # {sample_num} | train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
-            f"lr {self.optimizer.param_groups[0]['lr']:.6f} | "
+            f"lr {(self.optimizer.param_groups[0]['lr'] if self.optimizer is not None else 0.0):.6f} | "
             f"Num_Classes {len(self.exposed_classes)} | "
             f"running_time {datetime.timedelta(seconds=int(time.time() - self.start_time))} | "
             f"ETA {datetime.timedelta(seconds=int((time.time() - self.start_time) * (self.total_samples*self.num_epochs-sample_num) / sample_num))}"

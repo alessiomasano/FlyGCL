@@ -11,6 +11,8 @@ from .hide_adapter_vit import HiDeAdapterModel
 from .sdlora import SDLoRAModel
 from .sprompt import SPrompt
 from .finetune_vit import FinetuneViT
+from .cflora import CFLoRA
+from .singleprompt import SinglePromptViT
 
 MODELS = {
     "codaprompt": CodaPrompt,
@@ -32,4 +34,6 @@ MODELS = {
     "seq_finetune": FinetuneViT,
     "linear_probe": FinetuneViT,
     "seq_finetune_small_lr": FinetuneViT,
+    "cflora": CFLoRA,
+    "singleprompt": SinglePromptViT,
 }

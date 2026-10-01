@@ -11,6 +11,8 @@ from .sprompt import SPrompt as SPromptTrainer
 from .ewc import EWC
 from .lwf import LwF
 from .seq_baselines import LinearProbe, SeqFinetune, SeqFinetuneSmallLR
+from .cflora import CFLoRATrainer
+from .singleprompt import SinglePromptTrainer
 
 METHODS = {
     "codaprompt": CodaPrompt,
@@ -33,4 +35,6 @@ METHODS = {
     "seq_finetune": SeqFinetune,
     "linear_probe": LinearProbe,
     "seq_finetune_small_lr": SeqFinetuneSmallLR,
+    "cflora": CFLoRATrainer,
+    "singleprompt": SinglePromptTrainer,
 }

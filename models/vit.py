@@ -761,11 +761,20 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
 
     _logger.info(pretrained_cfg)
 
+    # timm 0.6.x resolves `file` before `custom_load` and would torch.load() the .npz: load it ourselves instead.
+    npz_local = None
+    if pretrained:
+        cfg_file = pretrained_cfg.get('file') if isinstance(pretrained_cfg, dict) else getattr(pretrained_cfg, 'file', None)
+        if cfg_file and str(cfg_file).endswith('.npz'):
+            npz_local = str(cfg_file)
     model = build_model_with_cfg(
-        VisionTransformer, variant, pretrained,
+        VisionTransformer, variant, pretrained and npz_local is None,
         pretrained_cfg=pretrained_cfg,
         pretrained_filter_fn=checkpoint_filter_fn,
         **kwargs)
+    if npz_local is not None:
+        _logger.info(f'Loading .npz weights via model.load_pretrained: {npz_local}')
+        model.load_pretrained(npz_local)
     return model
 
 

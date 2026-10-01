@@ -9,6 +9,7 @@ from .ImageNet import ImageNet
 from .ImageNet100 import ImageNet100
 from .ImageNet900 import ImageNet900
 from .Imagenet_R import Imagenet_R
+from .DomainNet import DomainNet
 from .ImageNetRandom import ImageNetRandom
 from .ImageNetSub import ImageNetSub
 from .NCH import NCH
@@ -29,6 +30,7 @@ DATASETS = {
     "imagenet900": ImageNet900,
     "imagenetsub": ImageNetSub,
     "imagenet-r": Imagenet_R,
+    "domainnet": DomainNet,
     "imagenetrandom": ImageNetRandom,
     'nch': NCH,
     'places365': Places365,

@@ -15,11 +15,12 @@ class RanPAC(_Trainer):
 
         self.task_id = 0
         self.first_task_completed = False
+        self.first_tasks = int(getattr(self, 'ranpac_first_tasks', 1) or 1)   # length of the first session in tasks (paper: 1)
 
     def online_step(self, images, labels, idx):
         self.add_new_class(labels)
 
-        if self.task_id == 0:
+        if self.task_id < self.first_tasks:
             return self._train_first_task(images, labels)
         else:
             return self._collect_features_for_statistics(images, labels)
@@ -119,13 +120,13 @@ class RanPAC(_Trainer):
         num_data_l = torch.zeros(self.n_classes)
         label = []
 
-        if not end and self.task_id > 0:
+        if not end and self.task_id >= self.first_tasks:
             if self.distributed:
                 saved_state = self.model.module.save_classifier_state()
             else:
                 saved_state = self.model.save_classifier_state()
 
-        if self.task_id > 0 and self.first_task_completed:
+        if self.task_id >= self.first_tasks and self.first_task_completed:
             if self.distributed:
                 self.model.module.update_statistics_and_classifier()
             else:
@@ -158,7 +159,7 @@ class RanPAC(_Trainer):
                 total_loss += loss.item()
                 label += y.tolist()
 
-        if not end and self.task_id > 0:
+        if not end and self.task_id >= self.first_tasks:
             if self.distributed:
                 self.model.module.restore_classifier_state(saved_state)
             else:
@@ -172,7 +173,7 @@ class RanPAC(_Trainer):
         return eval_dict
 
     def online_before_task(self, task_id):
-        if task_id == 0:
+        if task_id < self.first_tasks:
             if not self.distributed:
                 if self.model.use_g_prompt:
                     self.model.freeze_backbone_except_prompts()
@@ -200,7 +201,7 @@ class RanPAC(_Trainer):
             logger.info(f"Task {task_id} ({mode} mode): collecting features for RanPAC statistics")
 
     def online_after_task(self, cur_iter):
-        if self.task_id == 0:
+        if self.task_id == self.first_tasks - 1:
             logger.info("Completing first task training, setting up random projection")
 
             if not self.distributed:

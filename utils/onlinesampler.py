@@ -418,3 +418,147 @@ class OnlineTestSampler(DistributedSampler):
 
     def __len__(self):
         return self.num_selected_samples
+
+class CIRSampler(Sampler):
+    """Class-Incremental with Repetition (Hemati et al., CoLLAs 2023, G_samp-style) stream for the FlyGCL trainer.
+
+    Occurrence matrix O (C x E): class c first appears in experience e_c ~ Uniform{0 .. E-3} ('uniform') or, with 'front',
+    half of the classes at e=0 and the rest uniform; afterwards it re-appears in each later experience with probability p_rep
+    (at least one repetition is forced when p_rep > 0 so every class can be measured after a gap). Each class's training
+    samples are shuffled and split equally over its occurrences: single pass, stream length = dataset size.
+    Interface used by the trainer: set_task(t) (in place), __iter__, __len__, disjoint_classes (unused, kept for compatibility)."""
+
+    def __init__(self, data_source, num_experiences: int, p_rep: float, rnd_seed: int, first: str = "uniform", **unused):
+        self.data_source = data_source; self.E = int(num_experiences); self.p_rep = float(p_rep)
+        g = torch.Generator().manual_seed(int(rnd_seed))
+        targets = torch.as_tensor(data_source.targets); self.classes = list(range(int(targets.max()) + 1)); C = len(self.classes)
+        first_e = torch.randint(0, max(self.E - 2, 1), (C,), generator=g)
+        if first == "front":
+            front = torch.randperm(C, generator=g)[: C // 2]; first_e[front] = 0
+        O = torch.zeros(C, self.E, dtype=torch.bool)
+        for c in range(C):
+            O[c, first_e[c]] = True
+            later = torch.arange(first_e[c] + 1, self.E)
+            if len(later) > 0 and self.p_rep > 0:
+                rep = torch.rand(len(later), generator=g) < self.p_rep
+                if not rep.any():
+                    rep[torch.randint(0, len(later), (1,), generator=g)] = True   # force >= 1 repetition
+                O[c, later[rep]] = True
+        self.occurrence = O
+        self.indices = [[] for _ in range(self.E)]
+        for c in range(C):
+            idx = torch.nonzero(targets == c).flatten(); idx = idx[torch.randperm(len(idx), generator=g)]
+            occ = torch.nonzero(O[c]).flatten().tolist()
+            for k, chunk in enumerate(torch.tensor_split(idx, len(occ))):
+                self.indices[occ[k]].extend(chunk.tolist())
+        for e in range(self.E):
+            perm = torch.randperm(len(self.indices[e]), generator=g); self.indices[e] = [self.indices[e][i] for i in perm.tolist()]
+        self.disjoint_classes = [[] for _ in range(self.E)]
+        self.task = 0
+        for e in range(self.E):
+            logger.info(f"[CIR] experience {e}: {int(O[:, e].sum())} classes, {len(self.indices[e])} samples, "
+                        f"{int((O[:, e] & (O[:, :e].sum(1) > 0)).sum())} returning")
+
+    def set_task(self, cur_iter):
+        self.task = int(cur_iter)
+
+    def __iter__(self):
+        return iter(self.indices[self.task])
+
+    def __len__(self):
+        return len(self.indices[self.task])
+
+
+class FewShotSampler(Sampler):
+    """Base-then-few-shot task-free stream. Experience 0: a fraction `base_frac` of the classes with (1 - trickle) of their
+    training samples. Experiences 1..E-1: the remaining classes split evenly, each contributing only `shots` samples (the rest
+    are dropped), mixed with the reserved `trickle` fraction of base-class samples spread uniformly so the common classes never
+    stop flowing (no clean boundary). Single pass. Interface: set_task(t), __iter__, __len__, disjoint_classes (classes that
+    first appear in each experience)."""
+
+    def __init__(self, data_source, num_experiences: int, shots: int, rnd_seed: int, base_frac: float = 0.5, trickle: float = 0.2, **unused):
+        self.E = int(num_experiences); g = torch.Generator().manual_seed(int(rnd_seed))
+        targets = torch.as_tensor(data_source.targets); C = int(targets.max()) + 1
+        perm = torch.randperm(C, generator=g); n_base = int(round(base_frac * C))
+        base, novel = perm[:n_base].tolist(), perm[n_base:]
+        self.indices = [[] for _ in range(self.E)]
+        for c in base:
+            idx = torch.nonzero(targets == c).flatten(); idx = idx[torch.randperm(len(idx), generator=g)]
+            k = int(round(trickle * len(idx))) if self.E > 1 else 0
+            self.indices[0].extend(idx[k:].tolist())
+            for e, chunk in enumerate(torch.tensor_split(idx[:k], max(self.E - 1, 1)), start=1):
+                self.indices[e].extend(chunk.tolist())
+        groups = torch.tensor_split(novel, self.E - 1) if self.E > 1 else []
+        self.disjoint_classes = [sorted(base)] + [sorted(grp.tolist()) for grp in groups]
+        for e, grp in enumerate(groups, start=1):
+            for c in grp.tolist():
+                idx = torch.nonzero(targets == c).flatten(); idx = idx[torch.randperm(len(idx), generator=g)][: int(shots)]
+                self.indices[e].extend(idx.tolist())
+        for e in range(self.E):
+            perm_e = torch.randperm(len(self.indices[e]), generator=g); self.indices[e] = [self.indices[e][i] for i in perm_e.tolist()]
+            logger.info(f"[FEWSHOT] experience {e}: {len(self.indices[e])} samples, {len(self.disjoint_classes[e])} new classes"
+                        f"{' (' + str(int(shots)) + ' shots each)' if e > 0 else ''}")
+        self.task = 0
+
+    def set_task(self, cur_iter):
+        self.task = int(cur_iter)
+
+    def __iter__(self):
+        return iter(self.indices[self.task])
+
+    def __len__(self):
+        return len(self.indices[self.task])
+
+
+class RenditionSampler(Sampler):
+    """ImageNet-R stream whose experiences are RENDITION blocks that recur (e.g. sketch cartoon painting sketch tattoo cartoon
+    misc sketch): every class can recur, but with a domain change between experiences. A rendition appearing k times has its
+    samples split into k disjoint chunks (single pass). Requires an ImageFolder-like dataset whose file names start with
+    '<rendition>_' (the standard ImageNet-R naming)."""
+
+    def __init__(self, data_source, sequence, rnd_seed: int, rend_len: int = 8, rend_p_return: float = 0.5, rend_min: int = 1000, **unused):
+        base = data_source.dataset if hasattr(data_source, "dataset") else data_source
+        paths = [p for p, _ in base.samples]
+        import os
+        rend = [os.path.basename(p).split("_")[0] for p in paths]
+        g = torch.Generator().manual_seed(int(rnd_seed))
+        if list(sequence) == ["random"]:
+            # randomized domain sequence (seeded): domains with >= rend_min train images; each step returns to an already
+            # seen domain with probability rend_p_return (uniform over seen ones, never the current), otherwise moves to an
+            # unseen domain (uniform); when all are seen, always returns.
+            counts = {}
+            for r in rend:
+                counts[r] = counts.get(r, 0) + 1
+            pool = sorted(r for r, c in counts.items() if c >= rend_min)
+            order = [pool[i] for i in torch.randperm(len(pool), generator=g).tolist()]
+            seq = [order[0]]; unseen = order[1:]
+            while len(seq) < int(rend_len):
+                seen = [r for r in dict.fromkeys(seq) if r != seq[-1]]
+                go_back = (torch.rand(1, generator=g).item() < rend_p_return and seen) or not unseen
+                if go_back and seen:
+                    seq.append(seen[torch.randint(0, len(seen), (1,), generator=g).item()])
+                else:
+                    seq.append(unseen.pop(0))
+            sequence = seq
+            logger.info(f"[REND] random sequence (seed {rnd_seed}, p_return {rend_p_return}): {sequence}")
+        self.sequence = list(sequence); self.E = len(self.sequence)
+        self.indices = [[] for _ in range(self.E)]
+        for r in sorted(set(self.sequence)):
+            idx = torch.tensor([i for i, x in enumerate(rend) if x == r]); idx = idx[torch.randperm(len(idx), generator=g)]
+            occ = [e for e, x in enumerate(self.sequence) if x == r]
+            for k, chunk in enumerate(torch.tensor_split(idx, len(occ))):
+                self.indices[occ[k]] = chunk.tolist()
+        self.disjoint_classes = [[] for _ in range(self.E)]; self.task = 0
+        targets = torch.as_tensor(base.targets)
+        for e in range(self.E):
+            cls = targets[torch.tensor(self.indices[e], dtype=torch.long)].unique() if self.indices[e] else torch.tensor([])
+            logger.info(f"[REND] experience {e} ({self.sequence[e]}): {len(self.indices[e])} samples, {len(cls)} classes")
+
+    def set_task(self, cur_iter):
+        self.task = int(cur_iter)
+
+    def __iter__(self):
+        return iter(self.indices[self.task])
+
+    def __len__(self):
+        return len(self.indices[self.task])
